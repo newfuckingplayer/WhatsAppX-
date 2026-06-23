@@ -348,6 +348,7 @@ client.on("qr", async (qr) => {
 client.on("ready", async () => {
     global.loggedin = 1;
     console.log("Server A and B are ready.");
+    console.log(`[ready] client.info = ${JSON.stringify(client.info)}`);
     try {
         const chats = await client.getChats();
         console.log(`[ready] client.getChats() immediately after ready: ${chats.length} chats found`);
@@ -469,33 +470,65 @@ app.post("/syncChat/:contactId", async (req, res) => {
 });
 
 app.all("/getBroadcasts", async (req, res) => {
+    console.log(`[getBroadcasts] Request received at ${new Date().toISOString()}`);
     try {
         const broadcasts = await client.getBroadcasts();
+        console.log(`[getBroadcasts] client.getBroadcasts() resolved with ${broadcasts.length} broadcasts`);
         const filteredBroadcasts = broadcasts.filter(broadcast => broadcast.msgs.length > 0);
+        console.log(`[getBroadcasts] ${filteredBroadcasts.length} have messages. Sending response.`);
         res.json({ broadcastList: filteredBroadcasts });
     } catch (error) {
+        console.error(`[getBroadcasts] FAILED:`, error.message);
         res.status(500).send("Failed to get broadcasts: " + error.message);
     }
 });
 
 app.all("/getContacts", async (req, res) => {
+    console.log(`[getContacts] Request received at ${new Date().toISOString()}`);
     try {
         const allContacts = await client.getContacts();
+        console.log(`[getContacts] client.getContacts() resolved with ${allContacts.length} total contacts`);
         const waContacts = allContacts.filter(contact =>
-            contact.id.server === "c.us" && contact.isWAContact
+            contact.isMe || (contact.id.server === "c.us" && contact.isWAContact)
         );
+        console.log(`[getContacts] ${waContacts.length} passed the filter (isMe or isWAContact)`);
 
-        const contactList = await Promise.all(waContacts.map(async (contact) => {
-            if (contact.isMyContact === true && contact.isWAContact === true) {
-                const about = await contact.getAbout();
-                const commonGroups = await contact.getCommonGroups();
-                contact.profileAbout = about;
-                contact.commonGroups = commonGroups;
+        const contactListRaw = await Promise.all(waContacts.map(async (contact) => {
+            try {
+                if (contact.isMyContact === true && contact.isWAContact === true) {
+                    const about = await contact.getAbout();
+                    const commonGroups = await contact.getCommonGroups();
+                    contact.profileAbout = about;
+                    contact.commonGroups = commonGroups;
+                }
+                const formattedNumber = await contact.getFormattedNumber();
+                contact.formattedNumber = formattedNumber;
+                return contact;
+            } catch (err) {
+                console.error(`[getContacts] Failed processing contact ${contact.id?._serialized}: ${err.message}`);
+                contact.formattedNumber = contact.number;
+                return contact;
             }
-            const formattedNumber = await contact.getFormattedNumber();
-            contact.formattedNumber = formattedNumber;
-            return contact;
         }));
+        const contactList = contactListRaw.filter(Boolean);
+
+        if (!contactList.some(c => c.isMe)) {
+            console.log("[getContacts] No 'isMe' contact found in collection — synthesizing one from client.info.");
+            contactList.push({
+                id: client.info.wid,
+                number: client.info.wid.user,
+                name: client.info.pushname,
+                pushname: client.info.pushname,
+                shortName: client.info.pushname,
+                isMe: true,
+                isUser: true,
+                isGroup: false,
+                isWAContact: true,
+                isMyContact: false,
+                isBlocked: false,
+                formattedNumber: client.info.wid.user,
+            });
+        }
 
         contactList.sort((a, b) => {
             const nameA = (a.name || "").toLowerCase();
@@ -505,8 +538,10 @@ app.all("/getContacts", async (req, res) => {
             return 0;
         });
 
+        console.log(`[getContacts] Sending ${contactList.length} contacts. Has isMe: ${contactList.some(c => c.isMe)}`);
         res.json({ contactList });
     } catch (error) {
+        console.error(`[getContacts] FAILED:`, error.message);
         res.status(500).send("Failed to get contacts: " + error.message);
     }
 });
@@ -531,12 +566,13 @@ app.all("/getGroups", async (req, res) => {
 
 app.all("/getProfileImg/:id", async (req, res) => {
     try {
-        if (!req.params.id || req.params.id === "null" || req.params.id === "undefined") {
-            console.log(`[getProfileImg] Rejected — invalid id param: "${req.params.id}"`);
-            return res.status(400).send("Invalid id");
+        let targetId = req.params.id;
+        if (!targetId || targetId === "null" || targetId === "undefined") {
+            targetId = client.info.wid.user;
+            console.log(`[getProfileImg] No id provided — treating as own profile: ${targetId}`);
         }
-        const profilePicUrl = await client.getProfilePicUrl(req.params.id + "@c.us");
-        console.log(`[getProfileImg] ${req.params.id}@c.us -> ${profilePicUrl}`);
+        const profilePicUrl = await client.getProfilePicUrl(targetId + "@c.us");
+        console.log(`[getProfileImg] ${targetId}@c.us -> ${profilePicUrl}`);
         if (!profilePicUrl) {
             return res.status(404).send("No profile picture URL resolved");
         }
@@ -547,6 +583,18 @@ app.all("/getProfileImg/:id", async (req, res) => {
         res.send(buffer);
     } catch (error) {
         console.error(`[getProfileImg] FAILED for ${req.params.id}:`, error.message);
+        res.status(500).send(error.message);
+    }
+});
+
+app.get("/getMyInfo", async (req, res) => {
+    try {
+        res.json({
+            id: client.info.wid.user,
+            serializedId: client.info.wid._serialized,
+            pushname: client.info.pushname,
+        });
+    } catch (error) {
         res.status(500).send(error.message);
     }
 });
