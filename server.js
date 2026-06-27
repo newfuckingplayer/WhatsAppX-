@@ -472,6 +472,7 @@ app.get("/qr", async (req, res) => {
 });
 
 let inFlightGetChats = null;
+let inFlightGetContacts = null;
 
 // --- Lightweight caching + concurrency control (no new dependencies) ---
 
@@ -510,9 +511,9 @@ const messagesCache = makeTTLCache();
 // adicionales por mensaje.
 const contactNameCache = new Map();
 
-const CHATS_CACHE_TTL = 20 * 1000;        // chat list changes often — short TTL
-const CONTACTS_CACHE_TTL = 5 * 60 * 1000; // contacts rarely change — longer TTL
-const MESSAGES_CACHE_TTL = 15 * 1000;     // avoid instant re-fetch on rapid re-open
+const CHATS_CACHE_TTL = 20 * 1000;       // chat list changes often — short TTL
+const CONTACTS_CACHE_TTL = 60 * 1000;    // shortened from 5 min — self-heals faster if anything is ever wrong
+const MESSAGES_CACHE_TTL = 15 * 1000;    // avoid instant re-fetch on rapid re-open
 
 // Run async tasks with a concurrency cap instead of firing everything via
 // Promise.all at once — important once you have thousands of contacts/chats,
@@ -537,6 +538,14 @@ async function runWithConcurrencyLimit(items, limit, worker) {
     await Promise.all(runners);
     return results;
 }
+
+app.get("/clearCache", (req, res) => {
+    chatsCache.clear();
+    contactsCache.clear();
+    messagesCache.clear();
+    console.log("[clearCache] All server-side caches cleared manually.");
+    res.json({ cleared: true });
+});
 
 app.all("/getChats", async (req, res) => {
     console.log(`[getChats] Request received at ${new Date().toISOString()}`);
@@ -622,6 +631,31 @@ app.all("/getBroadcasts", async (req, res) => {
         const broadcasts = await client.getBroadcasts();
         console.log(`[getBroadcasts] client.getBroadcasts() resolved with ${broadcasts.length} broadcasts`);
         const filteredBroadcasts = broadcasts.filter(broadcast => broadcast.msgs.length > 0);
+
+        // La app NO lee el nombre de esta respuesta — busca el id.user del
+        // broadcast dentro de su lista local de Contactos (vía getContactInfo:).
+        // Si el id real del autor es @lid, su número no coincide con ningún
+        // contacto guardado por @c.us, así que el nombre sale vacío. Lo
+        // resolvemos aquí y lo metemos en el mismo contactNameCache que ya
+        // usa /getContacts para inyectar entradas sintéticas.
+        let resolvedPosters = 0;
+        for (const broadcast of filteredBroadcasts) {
+            const fullId = broadcast.id?._serialized;
+            if (!fullId || contactNameCache.has(fullId)) continue;
+            try {
+                const contact = await client.getContactById(fullId);
+                const name = contact?.name || contact?.pushname || "";
+                if (name) {
+                    contactNameCache.set(fullId, name);
+                    contactsCache.clear(); // que /getContacts incluya esta entrada nueva pronto
+                    resolvedPosters++;
+                }
+            } catch (_) { /* ignorar */ }
+        }
+        if (resolvedPosters) {
+            console.log(`[getBroadcasts] ${resolvedPosters} autores de historia resueltos y añadidos al caché.`);
+        }
+
         console.log(`[getBroadcasts] ${filteredBroadcasts.length} have messages. Sending response.`);
         res.json({ broadcastList: filteredBroadcasts });
     } catch (error) {
@@ -633,13 +667,29 @@ app.all("/getBroadcasts", async (req, res) => {
 app.all("/getContacts", async (req, res) => {
     console.log(`[getContacts] Request received at ${new Date().toISOString()}`);
 
+    if (!global.loggedin) {
+        console.log(`[getContacts] Rejected — client not ready yet (global.loggedin is falsy).`);
+        return res.status(503).send("Client not ready yet");
+    }
+
     const cached = contactsCache.get("all", CONTACTS_CACHE_TTL);
     if (cached) {
         console.log(`[getContacts] Serving from cache (age < ${CONTACTS_CACHE_TTL}ms).`);
         return res.json(cached);
     }
 
-    try {
+    if (inFlightGetContacts) {
+        console.log(`[getContacts] Another request is already in flight — awaiting its result instead of duplicating work.`);
+        try {
+            const result = await inFlightGetContacts;
+            return res.json(result);
+        } catch (error) {
+            console.error(`[getContacts] FAILED (from shared in-flight request): ${error.message}`);
+            return res.status(500).send("Failed to get contacts: " + error.message);
+        }
+    }
+
+    inFlightGetContacts = (async () => {
         const allContacts = await client.getContacts();
         console.log(`[getContacts] client.getContacts() resolved with ${allContacts.length} total contacts`);
         const waContacts = allContacts.filter(contact =>
@@ -671,38 +721,22 @@ app.all("/getContacts", async (req, res) => {
         });
         const contactList = contactListRaw.filter(Boolean);
 
-        // Si no hay un contacto "isMe" en la colección, lo sintetizamos
-        // usando client.info. IMPORTANTE: client.info puede tardar un
-        // instante en poblarse completamente justo después de "ready" — si
-        // sintetizamos con datos incompletos (sin pushname) y ESE resultado
-        // se cachea, todo el mundo vería un perfil propio roto durante los
-        // próximos 5 minutos. Por eso: si client.info no está listo todavía,
-        // NO sintetizamos un placeholder roto y NO cacheamos esta respuesta,
-        // para que el siguiente intento (segundos después) lo reintente
-        // fresco en vez de quedar atascado con datos malos.
-        let skipCache = false;
         if (!contactList.some(c => c.isMe)) {
-            const infoReady = client.info && client.info.wid && client.info.wid.user && client.info.pushname;
-            if (infoReady) {
-                console.log("[getContacts] No 'isMe' contact found in collection — synthesizing one from client.info.");
-                contactList.push({
-                    id: client.info.wid,
-                    number: client.info.wid.user,
-                    name: client.info.pushname,
-                    pushname: client.info.pushname,
-                    shortName: client.info.pushname,
-                    isMe: true,
-                    isUser: true,
-                    isGroup: false,
-                    isWAContact: true,
-                    isMyContact: false,
-                    isBlocked: false,
-                    formattedNumber: client.info.wid.user,
-                });
-            } else {
-                console.log("[getContacts] No 'isMe' contact found AND client.info isn't fully ready yet — skipping synthesis and skipping cache for this response.");
-                skipCache = true;
-            }
+            console.log("[getContacts] No 'isMe' contact found in collection — synthesizing one from client.info.");
+            contactList.push({
+                id: client.info.wid,
+                number: client.info.wid.user,
+                name: client.info.pushname,
+                pushname: client.info.pushname,
+                shortName: client.info.pushname,
+                isMe: true,
+                isUser: true,
+                isGroup: false,
+                isWAContact: true,
+                isMyContact: false,
+                isBlocked: false,
+                formattedNumber: client.info.wid.user,
+            });
         }
 
         // Inyectar números del caché que no estaban en la agenda (autores de grupo
@@ -739,11 +773,18 @@ app.all("/getContacts", async (req, res) => {
 
         console.log(`[getContacts] Sending ${contactList.length} contacts. Has isMe: ${contactList.some(c => c.isMe)}`);
         const result = { contactList };
-        if (!skipCache) {
+        if (contactList.some(c => c.isMe)) {
             contactsCache.set("all", result);
         } else {
-            console.log("[getContacts] Not caching this response (client.info wasn't ready).");
+            console.log(`[getContacts] NOT caching — no isMe entry present (would lock in a broken response).`);
         }
+        return result;
+    })();
+
+    inFlightGetContacts.finally(() => { inFlightGetContacts = null; }).catch(() => {});
+
+    try {
+        const result = await inFlightGetContacts;
         res.json(result);
     } catch (error) {
         console.error(`[getContacts] FAILED:`, error.message);
